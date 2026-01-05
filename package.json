@@ -7,8 +7,10 @@
     "start": "node index.js"
   },
   "dependencies": {
+    "adm-zip": "^0.5.10",
     "archiver": "^6.0.2",
     "cors": "^2.8.5",
     "express": "^4.19.2"
   }
 }
+
