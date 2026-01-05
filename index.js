@@ -2,34 +2,47 @@ import express from "express";
 import cors from "cors";
 import crypto from "crypto";
 import fs from "fs";
-import path from "path";
+import fsp from "fs/promises";
 import os from "os";
+import path from "path";
+import { spawnSync } from "child_process";
 import archiver from "archiver";
 
 const app = express();
+
+// --------------------
+// Config
+// --------------------
 const PORT = process.env.PORT || 3000;
 
-// Optional security: if set, require header x-worker-secret to match it.
+// Optional security header: x-worker-secret
 const WORKER_API_SECRET = process.env.WORKER_API_SECRET || "";
 
-// We now support BOTH:
-// A) repo-root template.zip  (recommended for GitHub UI uploads)
-// B) unzipped folder template/capacitor-kit/base (optional)
-const TEMPLATE_ZIP_PATH = path.join(process.cwd(), "template.zip");
-const TEMPLATE_BASE_DIR = path.join(process.cwd(), "template", "capacitor-kit", "base");
+// Base URL for download links (Render public URL)
+const PUBLIC_BASE_URL =
+  process.env.PUBLIC_BASE_URL || "https://appstoreready-worker.onrender.com";
 
-// Download links expire after 30 minutes
-const DOWNLOAD_TTL_MS = 1000 * 60 * 30;
+// Where generated zip files are stored (ephemeral on Render, fine for now)
+const KIT_DIR = process.env.KIT_DIR || path.join(os.tmpdir(), "appstoreready_kits");
 
+// Where template zip is expected to exist in repo
+const TEMPLATE_ZIP_PATH =
+  process.env.TEMPLATE_ZIP_PATH || path.join(process.cwd(), "template.zip");
+
+// --------------------
+// Middleware
+// --------------------
 app.use(cors());
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 function nowISO() {
   return new Date().toISOString();
 }
+
 function makeId(prefix = "job") {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
 }
+
 function isValidUrl(u) {
   try {
     const url = new URL(u);
@@ -38,6 +51,7 @@ function isValidUrl(u) {
     return false;
   }
 }
+
 function requireWorkerSecret(req, res, next) {
   if (!WORKER_API_SECRET) return next();
   const provided = req.headers["x-worker-secret"];
@@ -47,83 +61,307 @@ function requireWorkerSecret(req, res, next) {
   next();
 }
 
-app.get("/", (req, res) => res.status(200).send("ok"));
-app.get("/health", (req, res) => res.json({ status: "ok", time: nowISO() }));
-
 // --------------------
-// In-memory jobs & downloads
+// Jobs (in-memory)
 // --------------------
 const JOBS = new Map(); // jobId -> job
-const DOWNLOADS = new Map(); // jobId -> { filePath, token, expiresAt }
 
 function addLog(job, message, level = "info") {
   job.logs.push({ ts: nowISO(), level, message });
 }
 
-function slugifyAppId(name) {
-  return String(name || "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "")
-    .slice(0, 32) || "myapp";
+function safeText(s, max = 5000) {
+  if (!s) return "";
+  const str = String(s);
+  return str.length > max ? str.slice(0, max) : str;
 }
 
-function deriveIds(appName) {
-  const base = slugifyAppId(appName);
+// --------------------
+// HTML parsing helpers
+// --------------------
+function stripHtml(html) {
+  return String(html || "")
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasTag(html, regex) {
+  return regex.test(String(html || ""));
+}
+
+function extractTitle(html) {
+  const m = String(html || "").match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  return m ? stripHtml(m[1]).slice(0, 200) : "";
+}
+
+function extractMetaDescription(html) {
+  const s = String(html || "");
+  const m =
+    s.match(/<meta[^>]+name=["']description["'][^>]*content=["']([^"']+)["'][^>]*>/i) ||
+    s.match(/<meta[^>]+content=["']([^"']+)["'][^>]*name=["']description["'][^>]*>/i);
+  return m ? m[1].trim().slice(0, 240) : "";
+}
+
+function extractLinks(html) {
+  const links = [];
+  const re = /<a[^>]+href=["']([^"']+)["'][^>]*>/gi;
+  const s = String(html || "");
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    links.push(m[1]);
+    if (links.length > 500) break;
+  }
+  return links;
+}
+
+function classify(status, message) {
+  return { status, message };
+}
+
+async function fetchWithTimeout(url, ms = 9000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), ms);
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "AppStoreReadyWorker/1.0 (+https://appstoreready-worker.onrender.com)",
+      },
+    });
+    const text = await res.text();
+    return { res, text };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+// --------------------
+// Readiness report
+// --------------------
+function buildReadinessReport({ input, fetched }) {
+  const { appUrl, hasLogin, hasPayments } = input;
+
+  const sections = [];
+  const finalUrl = fetched?.finalUrl || appUrl;
+
+  const finalUsesHttps = (() => {
+    try {
+      return new URL(finalUrl).protocol === "https:";
+    } catch {
+      return false;
+    }
+  })();
+
+  const html = fetched?.html || "";
+  const title = fetched?.title || "";
+  const desc = fetched?.description || "";
+
+  const hasViewport = hasTag(html, /<meta[^>]+name=["']viewport["']/i);
+  const hasManifest = hasTag(html, /<link[^>]+rel=["']manifest["']/i);
+  const hasAppleTouchIcon = hasTag(html, /<link[^>]+rel=["']apple-touch-icon["']/i);
+  const hasFavicon =
+    hasTag(html, /<link[^>]+rel=["']icon["']/i) ||
+    hasTag(html, /<link[^>]+rel=["']shortcut icon["']/i);
+
+  const links = extractLinks(html).map((l) => String(l).toLowerCase());
+  const hasPrivacyLink = links.some((l) => l.includes("privacy"));
+  const hasTermsLink = links.some((l) => l.includes("terms") || l.includes("conditions"));
+
+  // Identity
+  {
+    const items = [];
+    items.push(
+      title
+        ? classify("PASS", `Page title detected: “${title}”`)
+        : classify("WARN", "No <title> detected on the homepage. Add a clear title.")
+    );
+    items.push(
+      desc
+        ? classify("PASS", "Meta description detected (good for store listing clarity).")
+        : classify("WARN", "No meta description found. Add a short description.")
+    );
+    items.push(
+      hasViewport
+        ? classify("PASS", "Viewport meta tag found (mobile-friendly signal).")
+        : classify("WARN", "No viewport meta tag found (could hurt mobile layout).")
+    );
+    sections.push({ id: "identity", title: "App Identity", items });
+  }
+
+  // Media
+  {
+    const items = [];
+    items.push(classify("WARN", "Store screenshots are not verified yet. You’ll need screenshots."));
+    items.push(classify("PASS", "Fast Track can generate placeholder screenshots (optional) later."));
+    sections.push({ id: "media", title: "Screenshots & Media", items });
+  }
+
+  // Privacy
+  {
+    const items = [];
+    items.push(
+      finalUsesHttps
+        ? classify("PASS", `HTTPS confirmed (final URL: ${finalUrl}).`)
+        : classify("FAIL", "Your app is not loading over HTTPS (common submission blocker).")
+    );
+    items.push(
+      hasPrivacyLink
+        ? classify("PASS", "A “Privacy” link appears on the homepage.")
+        : classify("WARN", "No obvious “Privacy” link detected. Ensure a public Privacy Policy URL exists.")
+    );
+    items.push(
+      hasTermsLink
+        ? classify("PASS", "A “Terms” link appears on the homepage.")
+        : classify("WARN", "No obvious “Terms” link detected. Terms are recommended.")
+    );
+    items.push(
+      hasPayments
+        ? classify("WARN", "Payments detected: ensure Apple/Google compliant implementation.")
+        : classify("PASS", "No payments flagged (simpler compliance path).")
+    );
+    sections.push({ id: "privacy", title: "Privacy & Compliance", items });
+  }
+
+  // Functionality
+  {
+    const items = [];
+    items.push(
+      classify("WARN", "If this is a pure web wrapper, add native polish (splash/loading/error states).")
+    );
+    items.push(
+      hasManifest
+        ? classify("PASS", "Web manifest detected (PWA readiness).")
+        : classify("WARN", "No web manifest detected (not required, but helps).")
+    );
+    items.push(
+      hasFavicon
+        ? classify("PASS", "Icon/favicons detected.")
+        : classify("WARN", "No obvious icons detected. You’ll need app icons.")
+    );
+    items.push(
+      hasAppleTouchIcon
+        ? classify("PASS", "Apple touch icon detected.")
+        : classify("WARN", "No apple-touch-icon detected.")
+    );
+    sections.push({ id: "functionality", title: "Functionality Expectations", items });
+  }
+
+  // Reviewer
+  {
+    const items = [];
+    if (hasLogin) {
+      items.push(classify("WARN", "Login detected: you must provide reviewer access / demo account."));
+      items.push(classify("WARN", "If using social login, Apple may require Sign in with Apple."));
+    } else {
+      items.push(classify("PASS", "No login flagged (simpler review access)."));
+    }
+    items.push(classify("PASS", "Fast Track can generate Reviewer Notes template later."));
+    sections.push({ id: "reviewer", title: "Reviewer Clarity", items });
+  }
+
+  const allItems = sections.flatMap((s) => s.items);
+  const hasFail = allItems.some((i) => i.status === "FAIL");
+  const hasWarn = allItems.some((i) => i.status === "WARN");
+
+  const readiness = hasFail ? "High Risk" : hasWarn ? "Minor Risk" : "Ready";
+
+  const topRisks = [];
+  if (!finalUsesHttps) topRisks.push("Not loading over HTTPS (common blocker).");
+  if (!hasPrivacyLink) topRisks.push("Privacy Policy link not detected (must be publicly accessible).");
+  if (hasLogin) topRisks.push("Login requires reviewer access (demo account) for review.");
+
+  const nextSteps = [];
+  if (!hasPrivacyLink) nextSteps.push("Add a clear Privacy Policy link and ensure it’s publicly accessible.");
+  nextSteps.push("Prepare App Store / Google Play screenshots (placeholders later if needed).");
+
   return {
-    bundleId: `com.appstoreready.${base}`,
-    packageName: `com.appstoreready.${base}`,
+    readiness,
+    summary: {
+      appTitle: title || null,
+      finalUrl,
+      usesHttps: finalUsesHttps,
+      detected: {
+        viewportMeta: hasViewport,
+        manifest: hasManifest,
+        appleTouchIcon: hasAppleTouchIcon,
+        favicon: hasFavicon,
+        privacyLinkLikely: hasPrivacyLink,
+        termsLinkLikely: hasTermsLink,
+      },
+    },
+    topRisks: topRisks.slice(0, 3),
+    nextSteps: nextSteps.slice(0, 6),
+    sections,
   };
 }
 
 // --------------------
-// File helpers
+// Build Kit helpers
 // --------------------
-function copyDirRecursive(src, dest) {
-  fs.mkdirSync(dest, { recursive: true });
-  const entries = fs.readdirSync(src, { withFileTypes: true });
-  for (const entry of entries) {
-    const s = path.join(src, entry.name);
-    const d = path.join(dest, entry.name);
-    if (entry.isDirectory()) copyDirRecursive(s, d);
-    else fs.copyFileSync(s, d);
-  }
+function slugifyAppName(appName) {
+  return String(appName || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 40) || "myapp";
 }
 
-function walkFiles(dir, cb) {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) walkFiles(full, cb);
-    else cb(full);
-  }
+function deriveIds(appName) {
+  const slug = slugifyAppName(appName);
+  // simple deterministic defaults
+  const bundleId = `com.appstoreready.${slug}`;
+  const packageName = `com.appstoreready.${slug.replace(/-/g, "")}`;
+  return { bundleId, packageName };
 }
 
-function replaceTokensInTextFile(filePath, replacements) {
-  const ext = path.extname(filePath).toLowerCase();
-  const allowed = new Set([
-    ".md", ".txt", ".json", ".xml", ".plist", ".gradle", ".properties", ".yaml", ".yml"
-  ]);
-  if (!allowed.has(ext)) return;
+async function ensureDir(p) {
+  await fsp.mkdir(p, { recursive: true });
+}
 
+function tryUnzipWithSystem(zipPath, outDir) {
+  // node:18-slim may or may not have `unzip` installed.
+  // We'll try it anyway. If it fails, we fall back.
+  const r = spawnSync("unzip", ["-q", zipPath, "-d", outDir], { stdio: "pipe" });
+  return r.status === 0;
+}
+
+async function unzipTemplate(zipPath, outDir) {
+  // 1) Try system unzip
+  const ok = tryUnzipWithSystem(zipPath, outDir);
+  if (ok) return;
+
+  // 2) Fallback to adm-zip if installed
   try {
-    const raw = fs.readFileSync(filePath, "utf8");
-    let out = raw;
-    for (const [k, v] of Object.entries(replacements)) {
-      out = out.split(k).join(v);
-    }
-    if (out !== raw) fs.writeFileSync(filePath, out, "utf8");
-  } catch {
-    // ignore binary/non-utf8
+    const mod = await import("adm-zip"); // only works if dependency installed
+    const AdmZip = mod.default || mod;
+    const zip = new AdmZip(zipPath);
+    zip.extractAllTo(outDir, true);
+    return;
+  } catch (e) {
+    throw new Error(
+      `Could not unzip template.zip. System 'unzip' not available AND adm-zip not installed. ` +
+      `Fix: install 'adm-zip' OR add 'unzip' to the Docker image. Original: ${e?.message || e}`
+    );
   }
 }
 
 async function zipDirectory(sourceDir, outZipPath) {
-  await new Promise((resolve, reject) => {
+  await ensureDir(path.dirname(outZipPath));
+
+  return new Promise((resolve, reject) => {
     const output = fs.createWriteStream(outZipPath);
     const archive = archiver("zip", { zlib: { level: 9 } });
 
-    output.on("close", resolve);
-    archive.on("error", reject);
+    output.on("close", () => resolve());
+    output.on("error", (err) => reject(err));
+    archive.on("error", (err) => reject(err));
 
     archive.pipe(output);
     archive.directory(sourceDir, false);
@@ -131,163 +369,246 @@ async function zipDirectory(sourceDir, outZipPath) {
   });
 }
 
-// Unzip using archiver's companion "unzipper" would require another dep.
-// Instead: use system "unzip" if available (it is on Render & macOS linux base images).
-function unzipWithSystem(zipPath, destDir) {
-  // We avoid importing child_process at top to keep file simple.
-  const { execSync } = require("child_process");
-  fs.mkdirSync(destDir, { recursive: true });
-  execSync(`unzip -qq "${zipPath}" -d "${destDir}"`);
-}
+async function writeAppConfigFiles(rootDir, input) {
+  // This is where we make the kit usable:
+  // - write a simple CONFIG.json
+  // - patch capacitor.config.json if present
 
-// Determine where the base template exists after unzip.
-// Your zip should contain a top-level "template/" folder (because you zipped the folder itself).
-function resolveBaseFromUnzipped(unzippedRoot) {
-  // Most common: unzippedRoot/template/capacitor-kit/base
-  const p1 = path.join(unzippedRoot, "template", "capacitor-kit", "base");
-  if (fs.existsSync(p1)) return p1;
+  const { appName, appUrl } = input;
+  const { bundleId, packageName } = input;
 
-  // Alternative: unzippedRoot/capacitor-kit/base (if someone zipped inner contents)
-  const p2 = path.join(unzippedRoot, "capacitor-kit", "base");
-  if (fs.existsSync(p2)) return p2;
+  const config = {
+    appName,
+    appUrl,
+    bundleId,
+    packageName,
+    generatedAt: nowISO(),
+  };
 
-  // Alternative: unzippedRoot/base
-  const p3 = path.join(unzippedRoot, "base");
-  if (fs.existsSync(p3)) return p3;
+  await fsp.writeFile(
+    path.join(rootDir, "APPSTORE_READY_CONFIG.json"),
+    JSON.stringify(config, null, 2),
+    "utf8"
+  );
 
-  return null;
-}
+  const capPath = path.join(rootDir, "capacitor.config.json");
+  try {
+    const raw = await fsp.readFile(capPath, "utf8");
+    const parsed = JSON.parse(raw);
 
-function ensureTemplateAvailable() {
-  const zipExists = fs.existsSync(TEMPLATE_ZIP_PATH);
-  const dirExists = fs.existsSync(TEMPLATE_BASE_DIR);
+    // common capacitor config fields
+    parsed.appName = appName;
+    parsed.appId = bundleId; // capacitor uses appId for bundle identifier on iOS/Android
+    parsed.server = parsed.server || {};
+    parsed.server.url = appUrl;
+    parsed.server.cleartext = false;
 
-  if (!zipExists && !dirExists) {
-    throw new Error(
-      `No template found. Upload template.zip to repo root OR provide folder template/capacitor-kit/base.`
-    );
+    await fsp.writeFile(capPath, JSON.stringify(parsed, null, 2), "utf8");
+  } catch {
+    // ignore if not present or invalid json
   }
 }
 
 // --------------------
-// Build Kit processor (REAL: zip + download)
+// Job processors
 // --------------------
+async function processReadinessJob(jobId) {
+  const job = JOBS.get(jobId);
+  if (!job) return;
+
+  job.status = "running";
+  job.progress_step = "analyze";
+  addLog(job, "Job started. Fetching app URL…");
+
+  try {
+    const { appUrl } = job.input;
+    const start = Date.now();
+
+    const { res, text } = await fetchWithTimeout(appUrl, 9000);
+    addLog(job, `Fetched URL (status ${res.status}) in ${Date.now() - start}ms`);
+
+    const finalUrl = res.url || appUrl;
+    const html = safeText(text, 300000);
+
+    const title = extractTitle(html);
+    const description = extractMetaDescription(html);
+
+    job.progress_step = "readiness";
+    addLog(job, "Generating readiness report…");
+
+    const report = buildReadinessReport({
+      input: job.input,
+      fetched: { finalUrl, html, title, description },
+    });
+
+    job.output = { generatedAt: nowISO(), report };
+    job.status = "complete";
+    job.progress_step = "done";
+    addLog(job, `Readiness complete: ${report.readiness}`);
+  } catch (err) {
+    job.status = "error";
+    job.progress_step = "error";
+    const msg = `Error: ${err?.name || "UnknownError"} - ${err?.message || "Unknown message"}`;
+    addLog(job, msg, "error");
+    job.error_message = err?.message ? String(err.message) : "Unknown error";
+  }
+}
+
 async function processBuildKitJob(jobId) {
   const job = JOBS.get(jobId);
   if (!job) return;
 
   job.status = "running";
-  job.progress_step = "prepare";
+  job.progress_step = "init";
   addLog(job, "Build kit started.");
 
   try {
-    ensureTemplateAvailable();
-
-    const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "appstoreready-"));
-    let baseTemplatePath = null;
-
-    // Prefer template.zip if present (best for GitHub UI)
-    if (fs.existsSync(TEMPLATE_ZIP_PATH)) {
-      job.progress_step = "unzip";
-      addLog(job, "template.zip found. Unzipping…");
-
-      const unzipDir = path.join(tmpRoot, "unzipped_template");
-      unzipWithSystem(TEMPLATE_ZIP_PATH, unzipDir);
-
-      baseTemplatePath = resolveBaseFromUnzipped(unzipDir);
-      if (!baseTemplatePath) {
-        throw new Error(
-          `Unzipped template.zip but couldn't find base folder. Expected template/capacitor-kit/base inside the zip.`
-        );
-      }
-    } else {
-      // Fallback: unzipped template exists in repo
-      baseTemplatePath = TEMPLATE_BASE_DIR;
-      addLog(job, "Using unzipped template folder from repo.");
+    // Ensure template.zip exists
+    const exists = fs.existsSync(TEMPLATE_ZIP_PATH);
+    if (!exists) {
+      throw new Error(
+        `template.zip not found at ${TEMPLATE_ZIP_PATH}. Place template.zip at repo root or set TEMPLATE_ZIP_PATH.`
+      );
     }
 
-    // Create a kit folder to modify
-    job.progress_step = "copy";
-    addLog(job, "Copying base scaffold…");
+    job.progress_step = "unzip";
+    addLog(job, "template.zip found. Unzipping…");
 
-    const kitDirName = `${job.input.appName.replace(/\s+/g, "_")}_build_kit`;
-    const kitDir = path.join(tmpRoot, kitDirName);
-    copyDirRecursive(baseTemplatePath, kitDir);
+    const workDir = await fsp.mkdtemp(path.join(os.tmpdir(), `kit_${jobId}_`));
+    const extractedDir = path.join(workDir, "extracted");
+    await ensureDir(extractedDir);
 
-    // Remove node_modules if present
-    try {
-      fs.rmSync(path.join(kitDir, "node_modules"), { recursive: true, force: true });
-    } catch {}
+    await unzipTemplate(TEMPLATE_ZIP_PATH, extractedDir);
 
-    // Derive IDs
-    const derived = deriveIds(job.input.appName);
-    const bundleId = job.input.bundleId || derived.bundleId;
-    const packageName = job.input.packageName || derived.packageName;
+    // If your template zip contains a single folder, we want that folder as root
+    // Otherwise use extractedDir as root.
+    const children = await fsp.readdir(extractedDir, { withFileTypes: true });
+    const topFolders = children.filter((d) => d.isDirectory()).map((d) => d.name);
+    const kitRoot =
+      topFolders.length === 1 && children.length >= 1
+        ? path.join(extractedDir, topFolders[0])
+        : extractedDir;
 
-    job.progress_step = "personalize";
-    addLog(job, `Personalizing: bundleId=${bundleId} packageName=${packageName}`);
+    job.progress_step = "configure";
+    addLog(job, "Applying app config (appName/appUrl/bundleId)…");
 
-    // Tokens your template files may include (optional — safe if none exist)
-    const replacements = {
-      "{{APP_NAME}}": job.input.appName,
-      "{{APP_URL}}": job.input.appUrl,
-      "{{BUNDLE_ID}}": bundleId,
-      "{{PACKAGE_NAME}}": packageName,
-    };
+    await writeAppConfigFiles(kitRoot, job.input);
 
-    walkFiles(kitDir, (file) => replaceTokensInTextFile(file, replacements));
-
-    // Zip it
     job.progress_step = "zip";
-    addLog(job, "Zipping build kit…");
+    addLog(job, "Creating Build Kit zip…");
 
-    const zipPath = path.join(tmpRoot, `${kitDirName}.zip`);
-    await zipDirectory(kitDir, zipPath);
+    await ensureDir(KIT_DIR);
+    const zipPath = path.join(KIT_DIR, `${jobId}.zip`);
+    await zipDirectory(kitRoot, zipPath);
 
-    // Create secure download link
-    const token = crypto.randomBytes(16).toString("hex");
-    const expiresAt = Date.now() + DOWNLOAD_TTL_MS;
-    DOWNLOADS.set(jobId, { filePath: zipPath, token, expiresAt });
+    const downloadPath = `/download/${jobId}`;
+    const downloadUrl = `${PUBLIC_BASE_URL}${downloadPath}`;
 
-    const baseUrl =
-      process.env.RENDER_EXTERNAL_URL ||
-      process.env.RENDER_SERVICE_URL ||
-      `http://localhost:${PORT}`;
-
-    const zipUrl = `${baseUrl}/download/${jobId}?token=${token}`;
+    job.output = {
+      generatedAt: nowISO(),
+      zipUrl: downloadUrl,
+      downloadPath,
+      message: "Build Kit ready. Use zipUrl to download.",
+    };
 
     job.status = "complete";
     job.progress_step = "done";
-    job.output = {
-      generatedAt: nowISO(),
-      zipUrl,
-      message: "Build Kit ready for download.",
-      derived: { bundleId, packageName },
-    };
-
-    addLog(job, "Build kit complete. Download URL generated.");
+    addLog(job, "Build kit complete.");
   } catch (err) {
     job.status = "error";
     job.progress_step = "error";
-    job.error_message = err?.message ? String(err.message) : "Unknown error";
-    addLog(job, `Error: ${job.error_message}`, "error");
+    const msg = err?.message ? String(err.message) : "Unknown error";
+    addLog(job, `Error: ${msg}`, "error");
+    job.error_message = msg;
   }
 }
 
-// Cleanup expired downloads
-setInterval(() => {
-  const now = Date.now();
-  for (const [jobId, item] of DOWNLOADS.entries()) {
-    if (item.expiresAt <= now) {
-      try { fs.unlinkSync(item.filePath); } catch {}
-      DOWNLOADS.delete(jobId);
-    }
-  }
-}, 60_000);
+// --------------------
+// Routes
+// --------------------
+app.get("/", (req, res) => res.status(200).send("ok"));
 
-// --------------------
-// API endpoints
-// --------------------
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", time: nowISO() });
+});
+
+// Download the generated kit
+app.get("/download/:jobId", requireWorkerSecret, async (req, res) => {
+  const { jobId } = req.params;
+
+  // Only allow download for build_kit jobs that completed
+  const job = JOBS.get(jobId);
+  if (!job || job.type !== "build_kit") return res.status(404).json({ status: "not_found" });
+  if (job.status !== "complete") {
+    return res.status(400).json({ status: "not_ready", jobStatus: job.status });
+  }
+
+  const zipPath = path.join(KIT_DIR, `${jobId}.zip`);
+  if (!fs.existsSync(zipPath)) return res.status(404).json({ status: "zip_missing" });
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="${job.input.appName || "build_kit"}.zip"`);
+  fs.createReadStream(zipPath).pipe(res);
+});
+
+// Create readiness job
+app.post("/prepare-app", requireWorkerSecret, (req, res) => {
+  const { appName, appUrl, platform, framework, notes, hasLogin, hasPayments } = req.body || {};
+  const errors = [];
+
+  if (!appName || typeof appName !== "string" || appName.trim().length < 2) {
+    errors.push("appName is required (min 2 chars).");
+  }
+  if (!appUrl || typeof appUrl !== "string" || !isValidUrl(appUrl)) {
+    errors.push("appUrl must be a valid http(s) URL to your web app.");
+  }
+
+  const allowedPlatforms = ["ios", "android", "both"];
+  if (!allowedPlatforms.includes(platform)) errors.push(`platform must be one of: ${allowedPlatforms.join(", ")}.`);
+
+  const allowedFrameworks = ["lovable", "nextjs", "vite", "react", "other"];
+  if (!allowedFrameworks.includes(framework)) errors.push(`framework must be one of: ${allowedFrameworks.join(", ")}.`);
+
+  if (typeof hasLogin !== "boolean") errors.push("hasLogin must be true or false.");
+  if (typeof hasPayments !== "boolean") errors.push("hasPayments must be true or false.");
+
+  if (errors.length) return res.status(400).json({ status: "error", errors });
+
+  const jobId = makeId("prep");
+
+  const job = {
+    jobId,
+    type: "submission_readiness",
+    status: "queued",
+    progress_step: "input",
+    createdAt: nowISO(),
+    input: {
+      appName: appName.trim(),
+      appUrl: appUrl.trim(),
+      platform,
+      framework,
+      notes: typeof notes === "string" ? notes.trim() : "",
+      hasLogin,
+      hasPayments,
+    },
+    output: null,
+    error_message: null,
+    logs: [],
+  };
+
+  addLog(job, "Job created.");
+  JOBS.set(jobId, job);
+  setTimeout(() => processReadinessJob(jobId), 50);
+
+  return res.json({
+    status: "accepted",
+    jobId,
+    message: "Job created. Use GET /jobs/:jobId to check status.",
+    next: { poll: `/jobs/${jobId}` },
+  });
+});
+
+// Create build kit job (real zip)
 app.post("/build-kit", requireWorkerSecret, (req, res) => {
   const { appName, appUrl, platform, framework, notes, bundleId, packageName } = req.body || {};
   const errors = [];
@@ -296,23 +617,21 @@ app.post("/build-kit", requireWorkerSecret, (req, res) => {
     errors.push("appName is required (min 2 chars).");
   }
   if (!appUrl || typeof appUrl !== "string" || !isValidUrl(appUrl)) {
-    errors.push("appUrl must be a valid http(s) URL.");
+    errors.push("appUrl must be a valid http(s) URL to your web app.");
   }
 
   const allowedPlatforms = ["ios", "android", "both"];
-  if (!allowedPlatforms.includes(platform)) {
-    errors.push(`platform must be one of: ${allowedPlatforms.join(", ")}.`);
-  }
+  if (!allowedPlatforms.includes(platform)) errors.push(`platform must be one of: ${allowedPlatforms.join(", ")}.`);
 
   const allowedFrameworks = ["lovable", "nextjs", "vite", "react", "other"];
-  if (!allowedFrameworks.includes(framework)) {
-    errors.push(`framework must be one of: ${allowedFrameworks.join(", ")}.`);
-  }
+  if (!allowedFrameworks.includes(framework)) errors.push(`framework must be one of: ${allowedFrameworks.join(", ")}.`);
 
   if (bundleId && typeof bundleId !== "string") errors.push("bundleId must be a string.");
   if (packageName && typeof packageName !== "string") errors.push("packageName must be a string.");
 
   if (errors.length) return res.status(400).json({ status: "error", errors });
+
+  const derived = deriveIds(appName.trim());
 
   const jobId = makeId("kit");
   const job = {
@@ -327,8 +646,8 @@ app.post("/build-kit", requireWorkerSecret, (req, res) => {
       platform,
       framework,
       notes: typeof notes === "string" ? notes.trim() : "",
-      bundleId: bundleId || null,
-      packageName: packageName || null,
+      bundleId: (bundleId || derived.bundleId).trim(),
+      packageName: (packageName || derived.packageName).trim(),
     },
     output: null,
     error_message: null,
@@ -340,7 +659,7 @@ app.post("/build-kit", requireWorkerSecret, (req, res) => {
 
   setTimeout(() => processBuildKitJob(jobId), 50);
 
-  res.json({
+  return res.json({
     status: "accepted",
     jobId,
     message: "Build kit job created. Use GET /jobs/:jobId to check status.",
@@ -348,36 +667,36 @@ app.post("/build-kit", requireWorkerSecret, (req, res) => {
   });
 });
 
-app.get("/download/:jobId", (req, res) => {
-  const { jobId } = req.params;
-  const token = req.query.token;
-
-  const item = DOWNLOADS.get(jobId);
-  if (!item) return res.status(404).json({ status: "not_found" });
-  if (!token || token !== item.token) return res.status(401).json({ status: "unauthorized" });
-
-  res.setHeader("Content-Type", "application/zip");
-  res.setHeader("Content-Disposition", `attachment; filename="${jobId}.zip"`);
-
-  fs.createReadStream(item.filePath).pipe(res);
-});
-
+// Job polling
 app.get("/jobs/:jobId", requireWorkerSecret, (req, res) => {
-  const job = JOBS.get(req.params.jobId);
+  const { jobId } = req.params;
+  const job = JOBS.get(jobId);
   if (!job) return res.status(404).json({ status: "not_found" });
   res.json(job);
 });
 
+// Recent jobs
 app.get("/jobs", requireWorkerSecret, (req, res) => {
   const list = Array.from(JOBS.values())
     .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
     .slice(0, 25);
+
   res.json({ count: list.length, jobs: list });
 });
 
-app.use((req, res) => res.status(404).json({ status: "not_found" }));
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Worker running on port ${PORT}`);
+// 404 fallback
+app.use((req, res) => {
+  res.status(404).json({ status: "not_found" });
 });
+
+// Start server
+app.listen(PORT, "0.0.0.0", async () => {
+  try {
+    await ensureDir(KIT_DIR);
+  } catch {}
+  console.log(`Worker running on port ${PORT}`);
+  console.log(`Template zip path: ${TEMPLATE_ZIP_PATH}`);
+  console.log(`Kit output dir: ${KIT_DIR}`);
+});
+
 
