@@ -7,6 +7,9 @@ import os from "os";
 import path from "path";
 import { spawnSync } from "child_process";
 import archiver from "archiver";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+
 
 const app = express();
 
